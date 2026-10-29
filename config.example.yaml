@@ -1,0 +1,29 @@
+# 請複製為 config.yaml，並依自己的信箱通知調整。
+timezone: Asia/Taipei
+# 預設只搜尋近期課務郵件；如需補建學期初事件，可暫時調高。
+since_days: 120
+# Gmail 查詢：課程代碼或 e3 寄件者；部分課程可能使用其他寄件者。
+gmail_query: '{from:e3@nycu.edu.tw "1151."}'
+# 每次掃描的最大信件數；初次匯入可調大。
+max_messages: 1200
+# 要同步的 Calendar ID；預設為本人主要日曆。
+calendar_id: primary
+# 實際寫入日曆；首次請先用 --dry-run 確認內容。
+calendar_write: true
+# 排除課程關鍵字，留空表示全部課程。
+course_whitelist: []
+# 如郵件內容格式不規則，可填人工核實的事件，參考下面註解：
+manual_events: []
+#  - kind: deadline # deadline | exam | cancellation
+#    course: 1151.123456
+#    title: 某課程 HW1
+#    date: '2026-11-02'
+#    time: '23:59'     # deadline 可不填，預設 23:59
+#    source_url: https://e3p.nycu.edu.tw/mod/assign/view.php?id=123456
+#  - kind: exam
+#    course: 1151.123456
+#    title: 某課程期中考
+#    date: '2026-11-06'
+#    start: '13:30'    # 未確認時間時可留空（建立全天佔位）
+#    end: '16:30'      # 未確認結束時間時可留空，不會捏造時段
+#    location: 教室待確認
