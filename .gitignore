@@ -1,0 +1,28 @@
+# OAuth client secret, access/refresh tokens, and personally identifying data
+.secrets/
+secrets/
+credentials.json
+token.json
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+config.yaml
+.env
+.env.*
+!.env.example
+*.log
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+*.db-journal
+data/
