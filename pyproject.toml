@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nycu-e3-calendar"
+version = "0.1.0"
+description = "Privacy-first NYCU e3 Gmail coursework reminders and Google Calendar synchronization"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Community contributors"}]
+dependencies = [
+  "google-api-python-client>=2.140,<3",
+  "google-auth>=2.32,<3",
+  "google-auth-oauthlib>=1.2,<2",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+nycu-e3 = "nycu_e3.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nycu_e3*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
