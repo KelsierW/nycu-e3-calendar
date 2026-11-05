@@ -6,8 +6,9 @@ adds an extended private property to its own events and checks duplicates.
 from datetime import datetime, timedelta
 from hashlib import sha256
 import json
+import html
 
-from .parser import Entry, TZ, normalize
+from .parser import Entry, TZ, normalize, submission_matches, canonical_source, URL_RE
 
 
 def _all_day(entry: Entry) -> bool:
@@ -66,12 +67,18 @@ class CalendarSync:
 
     @staticmethod
     def _same_topic(existing, entry, body):
+        if existing.get('extendedProperties', {}).get('private', {}).get('nycuE3DigestDate'):
+            # Digest descriptions contain assignment links; they are never deadline events.
+            return False
         ex_key = existing.get("extendedProperties", {}).get("private", {}).get("nycuE3Key")
         if ex_key == entry.key:
             return True
         # Prefer a source-link match or a normalized title on the same day.
-        if entry.source_url and entry.source_url in existing.get("description", ""):
-            return True
+        if entry.source_url:
+            description = html.unescape(existing.get("description", "")).replace('\\n', '\n').replace('\\r', '\r')
+            if any(canonical_source(url) == canonical_source(entry.source_url)
+                   for url in URL_RE.findall(description)):
+                return True
         return (CalendarSync._date_of(existing) == entry.start.date().isoformat()
                 and normalize(existing.get("summary", "")) == normalize(body["summary"]))
 
@@ -92,6 +99,7 @@ class CalendarSync:
             fingerprint = _fingerprint(body)
             stored = self.state.event(entry.key)
             original = by_id.get(stored["event_id"]) if stored else None
+            stored_deleted = False
             if original is None and stored and stored["owned"]:
                 # A deadline moved outside the current date window. Fetch by ID
                 # before assuming the user deleted it (prevents duplicate events).
@@ -100,12 +108,34 @@ class CalendarSync:
                     fetched = self.api.events().get(calendarId=self.calendar_id, eventId=stored["event_id"]).execute()
                     if fetched.get("status") != "cancelled":
                         original = fetched
+                    else:
+                        stored_deleted = True
                 except HttpError as exc:
                     if exc.resp.status not in (404, 410):
                         raise
+                    stored_deleted = True
             if original is None:
                 original = next((e for e in existing if self._same_topic(e, entry, body)), None)
             if original is not None:
+                marker = original.get("extendedProperties", {}).get("private", {}).get("nycuE3Key")
+                if stored_deleted and marker != entry.key:
+                    # A retired generated event may have a pre-existing personal counterpart.
+                    # Adopt its identity without taking ownership or changing its contents.
+                    if write:
+                        self.state.save_event(entry.key, original['id'], fingerprint, False)
+                    actions.append(('已存在（保留原內容）', entry.title, original.get('htmlLink', '')))
+                    continue
+                if not stored and marker == entry.key:
+                    # Recover identity after a crash between remote insert and SQLite commit.
+                    if _fingerprint(original) != fingerprint:
+                        actions.append(("找到程式事件但本地紀錄遺失，請核對內容", entry.title, original.get("htmlLink", "")))
+                        continue
+                    if write:
+                        self.state.save_event(entry.key, original["id"], _fingerprint(original), True)
+                        stored = self.state.event(entry.key)
+                if stored and stored["owned"] and (marker != entry.key or original["id"] != stored["event_id"]):
+                    actions.append(("事件識別不符，保留原內容", entry.title, original.get("htmlLink", "")))
+                    continue
                 if not stored or not stored["owned"]:
                     # Pre-existing personal event. Do not overwrite its contents.
                     if write:
@@ -134,6 +164,8 @@ class CalendarSync:
             if not write:
                 actions.append(("預覽新增", entry.title, ""))
                 continue
+            # A deterministic ID closes the duplicate window after a process/network failure.
+            body["id"] = sha256((self.calendar_id + ":" + entry.key).encode()).hexdigest()
             created = self.api.events().insert(calendarId=self.calendar_id, body=body,
                                                sendUpdates="none").execute()
             existing.append(created)
@@ -143,26 +175,53 @@ class CalendarSync:
         return actions
 
     def mark_submitted(self, entries: list[Entry], submitted: set[tuple[str, str]], write=True):
-        """For locally owned reminder events, mark completion without deleting them."""
+        """Complete own events and verified legacy NYCU automation reminders only."""
+        from googleapiclient.errors import HttpError
+        matched = [e for e in entries if e.kind == 'deadline' and submission_matches(e, submitted)]
+        if not matched:
+            return []
+        legacy_rows = []
+        if any(not (self.state.event(e.key) or {}).get('owned') for e in matched):
+            legacy_rows = self.list_existing(min(e.start for e in matched)-timedelta(days=1),
+                                             max(e.end for e in matched)+timedelta(days=1))
         actions = []
-        for entry in entries:
-            if entry.kind != "deadline":
-                continue
-            if not any((not course or not entry.course or course == entry.course)
-                       and title and title in normalize(entry.title)
-                       for course, title in submitted):
-                continue
+        for entry in matched:
             saved = self.state.event(entry.key)
-            if not saved or not saved["owned"]:
+            if saved and saved['owned']:
+                try:
+                    event = self.api.events().get(calendarId=self.calendar_id, eventId=saved['event_id']).execute()
+                except HttpError as exc:
+                    if exc.resp.status not in (404, 410):
+                        raise
+                    continue
+                if event.get('extendedProperties', {}).get('private', {}).get('nycuE3Key') != entry.key:
+                    actions.append(('事件識別不符，保留原內容', entry.title, ''))
+                    continue
+            else:
+                def is_legacy(e):
+                    desc = html.unescape(e.get('description', ''))
+                    return (entry.course and entry.course in desc and 'NYCU e3 課業檢查' in desc
+                            and '自動同步' in desc and self._same_topic(e, entry, event_body(entry)))
+                event = next((e for e in legacy_rows if is_legacy(e)), None)
+                if event is None:
+                    continue
+            if event.get('status') == 'cancelled':
+                continue
+            title = event.get('summary', entry.title)
+            reminders = event.get('reminders', {})
+            if title.startswith('✅ ') and reminders.get('useDefault') is False and not reminders.get('overrides'):
                 continue
             if not write:
-                actions.append(("預覽已提交", entry.title, ""))
+                actions.append(('預覽已提交', entry.title, event.get('htmlLink', '')))
                 continue
-            event = self.api.events().get(calendarId=self.calendar_id, eventId=saved["event_id"]).execute()
-            if event.get("summary", "").startswith("✅ "):
-                continue
-            result = self.api.events().patch(calendarId=self.calendar_id, eventId=saved["event_id"],
-                     body={"summary": "✅ " + event.get("summary", entry.title),
-                           "reminders": {"useDefault": False, "overrides": []}}).execute()
-            actions.append(("已標註提交並取消提醒", entry.title, result.get("htmlLink", "")))
+            properties = event.get('extendedProperties', {})
+            body = {'summary': title if title.startswith('✅ ') else '✅ '+title,
+                    'reminders': {'useDefault': False, 'overrides': []},
+                    'extendedProperties': {**properties, 'private': {**properties.get('private', {}), 'nycuE3Key': entry.key}}}
+            previous_fingerprint = (saved or {}).get('fingerprint') or _fingerprint(event)
+            result = self.api.events().patch(calendarId=self.calendar_id, eventId=event['id'], body=body,
+                                            sendUpdates='none').execute()
+            # Keep the pre-completion fingerprint so a missing receipt never silently reopens it.
+            self.state.save_event(entry.key, event['id'], previous_fingerprint, True)
+            actions.append(('已標註提交並取消提醒', entry.title, result.get('htmlLink', '')))
         return actions
