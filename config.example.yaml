@@ -10,6 +10,9 @@ max_messages: 1200
 calendar_id: primary
 # 實際寫入日曆；首次請先用 --dry-run 確認內容。
 calendar_write: true
+# 每天 08:00 在 Google 日曆顯示課業摘要；Windows 安裝腳本另建 07:45 更新工作。
+# 摘要使用 popup 提醒，Android 仍須開啟 Google 日曆系統通知權限。
+daily_digest: false
 # 排除課程關鍵字，留空表示全部課程。
 course_whitelist: []
 # 如郵件內容格式不規則，可填人工核實的事件，參考下面註解：

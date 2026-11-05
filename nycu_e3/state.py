@@ -5,12 +5,21 @@ from datetime import datetime
 
 
 class State:
-    def __init__(self, filename: Path):
-        filename.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(filename)
+    def __init__(self, filename: Path, preview=False):
+        if preview:
+            self.db = sqlite3.connect(":memory:")
+            if filename.exists():
+                source = sqlite3.connect(filename.resolve().as_uri() + "?mode=ro", uri=True)
+                try:
+                    source.backup(self.db)
+                finally:
+                    source.close()
+        else:
+            filename.parent.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(filename)
         # The DB contains private course and video URLs; restrict local access.
         import os
-        if os.name == "posix":
+        if os.name == "posix" and not preview:
             os.chmod(filename, 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""

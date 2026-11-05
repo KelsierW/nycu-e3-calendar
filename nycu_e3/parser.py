@@ -8,19 +8,24 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
 import re
+import html
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from .gmail import Mail
 
 TZ = ZoneInfo("Asia/Taipei")
 DATE_PATTERN = r"(?:20\d{2}[-/]\d{1,2}[-/]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日|(?<!\d)\d{1,2}/\d{1,2}(?!\d))"
-DATE_RE = re.compile(DATE_PATTERN)
-TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
+MONTH_PATTERN = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+DATE_PATTERN = rf"(?:{DATE_PATTERN}|(?<!\w)\d{{1,2}}\s+{MONTH_PATTERN}(?:\s+20\d{{2}})?\b|\b{MONTH_PATTERN}\s+\d{{1,2}}(?:,?\s+20\d{{2}})?\b)"
+DATE_RE = re.compile(DATE_PATTERN, re.I)
+MONTH_NUMBERS = {m: i for i, m in enumerate(('jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'), 1)}
+TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)\s*(AM|PM)?(?!\d)", re.I)
 DUE_WORDS = re.compile(r"截止(?:日期|時間)?|繳交期限|繳交截止|due\s*date|deadline|\bis due\b|\bdue\b", re.I)
-ASSIGN_WORDS = re.compile(r"作業|報告|結報|預報|實驗|\bHW\s*[#\d]|exercise|assignment|deadline|due date", re.I)
+ASSIGN_WORDS = re.compile(r"作業|報告|結報|預報|實驗|\bHW\s*[#\d]|exercise|assignment|\blab\b|\breport\b|\bproject\b", re.I)
 EXAM_WORDS = re.compile(r"期中考|期末考|小考|考試|midterm|final exam|quiz", re.I)
 VIDEO_WORDS = re.compile(r"(?:教學|課程|上課|助教課|補課)?(?:影片|錄影|錄影檔)|lecture\s+video|video|recording|\.mp4", re.I)
 VIDEO_AVAILABLE = re.compile(r"已上傳|上傳完成|可以觀看|可觀看|觀看連結|影片連結|請觀看|video.*(?:upload|avail)|recording.*(?:upload|avail)|\.mp4", re.I)
-EXCLUDED = re.compile(r"遲交區|補交|late submission|late area", re.I)
+EXCLUDED = re.compile(r"遲交|補交|late\s*(?:submission|work|area)|resubmission|make[\s-]?up", re.I)
 NOT_REQUIRED = re.compile(r"免交|不需要繳交|無須繳交|不用繳交|no submission required", re.I)
 SUBMITTED = re.compile(r"You have submitted your assignment submission(?:\s+for\s+(.+))?", re.I)
 CANCELLED = re.compile(r"停課|本週不上課|課程取消|class cancel", re.I)
@@ -63,13 +68,29 @@ def normalize(text: str) -> str:
     return text
 
 
+def submission_matches(entry, submitted):
+    """Require the same known course; HW1 must never complete HW10."""
+    name = normalize(entry.title)
+    return any(course and entry.course and course == entry.course and title
+               and re.search(re.escape(title) + r"(?=$|[^a-z0-9]|deadline|duedate)", name)
+               for course, title in submitted)
+
+
 def _date(text: str, announced: datetime):
     match = DATE_RE.search(text)
     if not match:
         return None, None
     raw = match.group(0).replace("年", "-").replace("月", "-").replace("日", "").replace("/", "-")
     try:
-        chunks = [int(n) for n in raw.split("-")]
+        if re.search(r"[a-z]", raw, re.I):
+            parts = re.split(r"[\s,]+", raw.strip())
+            if parts[0].isdigit():
+                day, month = int(parts[0]), MONTH_NUMBERS[parts[1][:3].lower()]
+            else:
+                month, day = MONTH_NUMBERS[parts[0][:3].lower()], int(parts[1])
+            chunks = [int(parts[2]), month, day] if len(parts) > 2 else [month, day]
+        else:
+            chunks = [int(n) for n in raw.split("-")]
         if len(chunks) == 2:
             year = announced.astimezone(TZ).year
             # Past/future crossing Dec/Jan is resolved toward the closest 6 months.
@@ -80,13 +101,23 @@ def _date(text: str, announced: datetime):
                 year -= 1
             chunks = [year, *chunks]
         return datetime(*chunks, tzinfo=TZ), match.end()
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, KeyError):
         return None, None
 
 
 def _time(text: str) -> time | None:
     m = TIME_RE.search(text)
-    return time(int(m.group(1)), int(m.group(2))) if m else None
+    if not m:
+        return None
+    hour = int(m.group(1))
+    meridiem = (m.group(3) or '').upper()
+    if meridiem and not 1 <= hour <= 12:
+        return None
+    if meridiem == 'PM' and hour < 12:
+        hour += 12
+    elif meridiem == 'AM' and hour == 12:
+        hour = 0
+    return time(hour, int(m.group(2)))
 
 
 def _due_date(text: str, announced: datetime):
@@ -126,9 +157,20 @@ def _times(fragment: str):
 
 
 def _name(subject: str) -> str:
+    subject = re.sub(r"^\s*Due on .+?:\s+(?=\S)", "", subject, flags=re.I)
     subject = re.sub(r"^\s*(?:11\d\d\.\d{6}\s*[:»\-]?\s*)+", "", subject)
     subject = re.sub(r"^\s*(?:\[e3\]|\[提醒\]|\[公告\])\s*", "", subject, flags=re.I)
     return tidy(subject)[:130]
+
+
+def canonical_source(url: str) -> str:
+    parts = urlsplit(html.unescape(url.rstrip('.,;)]】')))
+    query = parse_qsl(parts.query)
+    if parts.path.endswith('/mod/assign/view.php'):
+        query = [(k, v) for k, v in query if k == 'id']
+    elif parts.path.endswith('/mod/forum/discuss.php'):
+        query = [(k, v) for k, v in query if k == 'd']
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, urlencode(query), ''))
 
 
 def _source(mail: Mail) -> str:
@@ -136,7 +178,7 @@ def _source(mail: Mail) -> str:
     for part in ("/mod/assign/view.php", "/mod/forum/discuss.php"):
         for url in matches:
             if part in url:
-                return url.rstrip(".),;］】")
+                return canonical_source(url.rstrip(".),;］】"))
     return mail.url
 
 
@@ -158,23 +200,71 @@ def parse_submission(mail: Mail):
     return (course, normalize(title)) if title else None
 
 
+def _digest_entries(mail: Mail):
+    """Split Moodle multi-assignment reminders before applying item exclusions."""
+    body = mail.body.replace('\r', '')
+    header = re.search(r"The following assignments are due on\s+([^\n]+)", body, re.I)
+    if not header:
+        return None
+    day, _ = _date(header.group(1), mail.date)
+    if not day:
+        return []
+    links = dict(re.findall(r"\[(\d+)\]\s+(https?://[^\s<>]+)", body))
+    entries = []
+    for match in re.finditer(r"^\s*\*\s*(.+?)(?=^\s*\*\s*|^\s*Links:|\Z)", body, re.M | re.S):
+        chunk = match.group(1)
+        item = re.search(r"(.+?)\s+in\s+course\s+(11\d\d\.\d{6})", chunk, re.I | re.S)
+        if not item:
+            continue
+        title, course = tidy(item.group(1)), item.group(2)
+        if EXCLUDED.search(title) or NOT_REQUIRED.search(title):
+            continue
+        due_line = re.search(r"\bDUE:\s*([^\n]+)", chunk, re.I)
+        clock = _time(due_line.group(1)) if due_line else None
+        clock = clock or time(23, 59)
+        due = day.replace(hour=clock.hour, minute=clock.minute)
+        reference = re.search(r"Go to activity\s*\[(\d+)\]", chunk, re.I)
+        source = canonical_source(links[reference.group(1)]) if reference and reference.group(1) in links else mail.url
+        aid = _assignment_identity(source)
+        key = f'deadline:{course}:{aid or normalize(title)}'
+        entries.append(Entry(key, 'deadline', course, title, due, due+timedelta(minutes=1), mail.date, source, '來源：e3/Gmail 多項作業截止提醒。'))
+    return entries
+
+
+def _forum_content(body):
+    """Publication timestamps in Moodle envelopes are not event/deadline dates."""
+    plain = body.replace('\r', '')
+    if re.search(r'->\s*Forums?\s*->', plain, re.I):
+        parts = re.split(r'(?m)^-{10,}\s*$', plain)
+        if len(parts) >= 3:
+            return parts[1]
+    return body
+
+
 def parse_entries(mail: Mail) -> list[Entry]:
     if SUBMITTED.search(mail.subject):
         return []
-    both = mail.subject + "\n" + mail.body
+    digest = _digest_entries(mail)
+    if digest is not None:
+        return digest
+    raw = mail.subject + "\n" + mail.body
+    both = mail.subject + "\n" + _forum_content(mail.body)
     name = _name(mail.subject)
-    course = (COURSE_RE.search(both) or [""])[0]
+    course = (COURSE_RE.search(raw) or [""])[0]
     src = _source(mail)
     result = []
     # Exclusion is based on the notification/title; an email that mentions a
     # regular and late area together may require an explicit manual override.
-    if ASSIGN_WORDS.search(name) and DUE_WORDS.search(both) and not EXCLUDED.search(name) and not NOT_REQUIRED.search(both):
+    assignment_notice = ASSIGN_WORDS.search(name) or re.search(r'\bThe assignment\b.+?\bin course\b', both, re.I | re.S)
+    if assignment_notice and DUE_WORDS.search(both) and not EXCLUDED.search(name) and not NOT_REQUIRED.search(both):
         due = _due_date(both, mail.date)
         if due:
-            aid = _assignment_identity(both)
+            aid = _assignment_identity(raw)
             key = f"deadline:{course}:{aid or normalize(name)}"
             result.append(Entry(key, "deadline", course, name, due, due + timedelta(minutes=1), mail.date, src, "來源：e3/Gmail 截止通知。"))
-    if EXAM_WORDS.search(name) or (re.search(r"考場|考試時間|exam", name, re.I) and EXAM_WORDS.search(both)):
+    exam_notice = EXAM_WORDS.search(name) or (re.search(r"考場|考試時間|exam", name, re.I) and EXAM_WORDS.search(both))
+    results_notice = re.search(r'考卷.*(?:領取|發還)|(?:領取|發還).*考卷|考試成績|期中.*(?:解答|成績)', name)
+    if exam_notice and not results_notice:
         day, fragment = _event_date(both, mail.date)
         if day:
             start_t, end_t = _times(fragment)
